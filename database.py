@@ -1,10 +1,12 @@
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import date
 
 from plan import METRIC_KEYS, get_week_number
 
-DB_PATH = "coaching.db"
+# On Amvera the persistent volume is mounted at /data
+DB_PATH = os.environ.get("DB_PATH", "/data/coaching.db" if os.path.isdir("/data") else "coaching.db")
 
 
 @contextmanager
