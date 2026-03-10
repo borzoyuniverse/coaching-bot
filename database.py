@@ -43,6 +43,54 @@ def init_db() -> None:
                 value TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS checkin_state (
+                chat_id   INTEGER PRIMARY KEY,
+                metric_index INTEGER DEFAULT 0,
+                date      TEXT
+            )
+        """)
+
+
+# ── Checkin state (persisted to DB so restarts don't break flow) ───────────────
+
+def checkin_start(chat_id: int, d: date) -> bool:
+    """Start a new checkin. Returns False if one is already in progress."""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT metric_index FROM checkin_state WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        if existing is not None:
+            return False  # Already in progress
+        conn.execute(
+            "INSERT INTO checkin_state (chat_id, metric_index, date) VALUES (?, 0, ?)",
+            (chat_id, d.isoformat()),
+        )
+        return True
+
+
+def checkin_get(chat_id: int) -> tuple[int, date] | None:
+    """Return (metric_index, date) or None if no active checkin."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT metric_index, date FROM checkin_state WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        if row:
+            return row["metric_index"], date.fromisoformat(row["date"])
+        return None
+
+
+def checkin_advance(chat_id: int, next_index: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE checkin_state SET metric_index = ? WHERE chat_id = ?",
+            (next_index, chat_id),
+        )
+
+
+def checkin_end(chat_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM checkin_state WHERE chat_id = ?", (chat_id,))
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────

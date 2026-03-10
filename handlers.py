@@ -1,8 +1,8 @@
 """
 Command handlers and evening check-in conversation flow.
 
-Check-in state is stored in memory (per chat_id). If the bot restarts
-mid-checkin, the user can restart with /checkin.
+Check-in state is persisted to SQLite so bot restarts don't break an
+ongoing check-in session.
 """
 
 import logging
@@ -11,17 +11,21 @@ from datetime import date
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from database import get_setting, save_setting, upsert_metric, get_day
-from messages import morning_message, daily_summary, weekly_summary
+from database import (
+    checkin_advance,
+    checkin_end,
+    checkin_get,
+    checkin_start,
+    get_setting,
+    save_setting,
+    upsert_metric,
+)
+from messages import daily_summary, morning_message, weekly_summary
 from plan import METRICS, get_week_number
 
 log = logging.getLogger(__name__)
 
-# Quick-input values shown as inline buttons
 QUICK_VALUES = [0, 1, 2, 3, 5, 10]
-
-# In-memory checkin state: {chat_id: {"index": int, "date": date}}
-_checkin_state: dict[int, dict] = {}
 
 
 # ── Keyboard ───────────────────────────────────────────────────────────────────
@@ -37,16 +41,19 @@ def _metric_keyboard() -> InlineKeyboardMarkup:
 # ── Check-in flow ──────────────────────────────────────────────────────────────
 
 async def start_checkin_flow(bot, chat_id: int) -> None:
-    """Start evening check-in: reset state and ask first metric."""
-    _checkin_state[chat_id] = {"index": 0, "date": date.today()}
+    """Start evening check-in. Silently skips if one is already in progress."""
+    started = checkin_start(chat_id, date.today())
+    if not started:
+        log.info("Checkin already in progress for %s, skipping duplicate", chat_id)
+        return
     await _ask_metric(bot, chat_id)
 
 
 async def _ask_metric(bot, chat_id: int) -> None:
-    state = _checkin_state.get(chat_id)
+    state = checkin_get(chat_id)
     if state is None:
         return
-    idx = state["index"]
+    idx, _ = state
     key, label = METRICS[idx]
     text = f"🎯 <b>({idx + 1}/8) {label}</b>\nСколько сегодня?"
     await bot.send_message(
@@ -58,40 +65,33 @@ async def _ask_metric(bot, chat_id: int) -> None:
 
 
 async def _process_value(bot, chat_id: int, value: int, query=None) -> None:
-    """Save metric value and advance to next metric (or finish)."""
-    state = _checkin_state.get(chat_id)
+    state = checkin_get(chat_id)
     if state is None:
         if query:
-            await query.answer("Сессия истекла. Начни /checkin заново.")
+            await query.answer("Сессия не найдена. Начни /checkin заново.")
         return
 
-    idx = state["index"]
-    d = state["date"]
+    idx, d = state
     key, label = METRICS[idx]
 
     upsert_metric(d, key, value)
 
-    # Acknowledge current metric
     ack_text = f"✅ {label}: {value}"
     if query:
         await query.edit_message_text(ack_text, parse_mode="HTML")
     else:
         await bot.send_message(chat_id=chat_id, text=ack_text, parse_mode="HTML")
 
-    # Advance
-    idx += 1
-    state["index"] = idx
-
-    if idx < len(METRICS):
+    next_idx = idx + 1
+    if next_idx < len(METRICS):
+        checkin_advance(chat_id, next_idx)
         await _ask_metric(bot, chat_id)
     else:
-        # All 8 metrics collected
-        del _checkin_state[chat_id]
+        checkin_end(chat_id)
         summary = daily_summary(d)
         await bot.send_message(chat_id=chat_id, text=summary, parse_mode="HTML")
 
-        # Sunday: send weekly summary after daily summary
-        if d.weekday() == 6:
+        if d.weekday() == 6:  # Sunday
             week = get_week_number(d)
             await bot.send_message(
                 chat_id=chat_id,
@@ -121,17 +121,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start_checkin_flow(context.bot, update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    # Reset any stuck state before starting manually
+    checkin_end(chat_id)
+    await start_checkin_flow(context.bot, chat_id)
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = daily_summary(date.today())
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(daily_summary(date.today()), parse_mode="HTML")
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = morning_message()
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(morning_message(), parse_mode="HTML")
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -161,8 +162,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    if chat_id not in _checkin_state:
-        return  # Not in check-in mode, ignore free text
+    if checkin_get(chat_id) is None:
+        return  # Not in check-in mode
 
     try:
         value = int(update.message.text.strip())
